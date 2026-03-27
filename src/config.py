@@ -232,6 +232,14 @@ class LLMSettings(HonchoSettings):
     )
 
 
+class ClaudeCLISettings(HonchoSettings):
+    model_config = SettingsConfigDict(env_prefix="CLAUDE_CLI_", extra="ignore")  # pyright: ignore
+
+    EXECUTABLE: str = "claude"
+    MAX_CONCURRENT: Annotated[int, Field(default=3, gt=0, le=10)] = 3
+    TIMEOUT_SECONDS: Annotated[int, Field(default=120, gt=0)] = 120
+
+
 class DeriverSettings(BackupLLMSettingsMixin, HonchoSettings):
     model_config = SettingsConfigDict(env_prefix="DERIVER_", extra="ignore")  # pyright: ignore
 
@@ -651,6 +659,7 @@ class AppSettings(HonchoSettings):
     AUTH: AuthSettings = Field(default_factory=AuthSettings)
     SENTRY: SentrySettings = Field(default_factory=SentrySettings)
     LLM: LLMSettings = Field(default_factory=LLMSettings)
+    CLAUDE_CLI: ClaudeCLISettings = Field(default_factory=ClaudeCLISettings)
     DERIVER: DeriverSettings = Field(default_factory=DeriverSettings)
     DIALECTIC: DialecticSettings = Field(default_factory=DialecticSettings)
     PEER_CARD: PeerCardSettings = Field(default_factory=PeerCardSettings)

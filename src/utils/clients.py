@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator, Callable
@@ -284,6 +285,10 @@ if settings.LLM.GROQ_API_KEY:
     groq = AsyncGroq(api_key=settings.LLM.GROQ_API_KEY)
     CLIENTS["groq"] = groq
 
+# claude-cli provider uses the local Claude Code CLI binary — no API key needed.
+# Register a sentinel string so the startup validation check passes.
+CLIENTS["claude-cli"] = "claude-cli"  # type: ignore[assignment]
+
 SELECTED_PROVIDERS = [
     ("Summary", settings.SUMMARY.PROVIDER),
     ("Deriver", settings.DERIVER.PROVIDER),
@@ -331,7 +336,9 @@ def convert_tools_for_provider(
     Returns:
         List of tool definitions in the provider's native format
     """
-    if provider == "anthropic":
+    if provider == "claude-cli":
+        raise NotImplementedError("claude-cli provider does not support tool calling")
+    elif provider == "anthropic":
         # Anthropic format: input_schema
         return tools
     elif provider in ("openai", "custom", "vllm"):
@@ -1185,6 +1192,158 @@ def _append_tool_results(
                     "content": str(tr["result"]),
                 }
             )
+
+_claude_cli_semaphore: "asyncio.Semaphore | None" = None
+
+
+def _get_claude_cli_semaphore() -> "asyncio.Semaphore":
+    global _claude_cli_semaphore
+    if _claude_cli_semaphore is None:
+        _claude_cli_semaphore = asyncio.Semaphore(settings.CLAUDE_CLI.MAX_CONCURRENT)
+    return _claude_cli_semaphore
+
+
+async def _call_claude_cli(
+    prompt: str,
+    model: str | None,
+    max_tokens: int,
+    json_mode: bool,
+    response_model: "type[BaseModel] | None",
+) -> "HonchoLLMCallResponse[Any]":
+    """
+    Execute a prompt via the local Claude Code CLI and return a HonchoLLMCallResponse.
+
+    Uses --output-format json for structured output from the CLI.
+    When json_mode or response_model is set, appends JSON schema instructions
+    to the prompt and uses --json-schema for native structured output.
+    """
+    full_prompt = prompt
+
+    if response_model is not None:
+        schema_json_str = json.dumps(response_model.model_json_schema(), indent=2)
+        full_prompt += f"\n\nRespond with valid JSON matching this schema:\n{schema_json_str}"
+    elif json_mode:
+        full_prompt += "\n\nRespond with valid JSON only. No prose, no markdown, just the JSON object."
+
+    cmd = [
+        settings.CLAUDE_CLI.EXECUTABLE,
+        "-p",
+        "--output-format", "json",
+        "--no-session-persistence",
+        "--dangerously-skip-permissions",
+    ]
+
+    if model:
+        cmd += ["--model", model]
+
+    if response_model is not None:
+        cmd += ["--json-schema", json.dumps(response_model.model_json_schema())]
+
+    cmd.append(full_prompt)
+
+    sem = _get_claude_cli_semaphore()
+    async with sem:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=settings.CLAUDE_CLI.TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                raise TimeoutError(
+                    f"claude-cli timed out after {settings.CLAUDE_CLI.TIMEOUT_SECONDS}s"
+                )
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"claude-cli executable not found: {settings.CLAUDE_CLI.EXECUTABLE}"
+            )
+
+    raw = stdout.decode("utf-8", errors="replace").strip()
+    if not raw:
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(f"claude-cli returned empty output. stderr: {stderr_text}")
+
+    try:
+        envelope = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"claude-cli returned non-JSON output: {raw[:200]}") from e
+
+    if envelope.get("is_error") or envelope.get("type") != "result":
+        result_text = envelope.get("result", "")
+        raise ValueError(f"claude-cli error: {result_text}")
+
+    result_text: str = envelope.get("result", "")
+    usage = envelope.get("usage", {})
+    input_tokens = int(usage.get("input_tokens", 0))
+    output_tokens = int(usage.get("output_tokens", 0))
+    cache_creation = int(usage.get("cache_creation_input_tokens", 0))
+    cache_read = int(usage.get("cache_read_input_tokens", 0))
+
+    if response_model is not None or json_mode:
+        repaired = validate_and_repair_json(result_text)
+
+        if response_model is not None:
+            if response_model is PromptRepresentation:
+                try:
+                    repaired_data = json.loads(repaired)
+                    if "deductive" in repaired_data and isinstance(repaired_data["deductive"], list):
+                        for item in repaired_data["deductive"]:
+                            if isinstance(item, dict):
+                                if "conclusion" not in item and "premises" in item:
+                                    item["conclusion"] = (
+                                        f"[Incomplete reasoning from premises: {item['premises'][0][:100]}...]"
+                                        if item["premises"]
+                                        else "[Incomplete reasoning - conclusion missing]"
+                                    )
+                                if "premises" not in item:
+                                    item["premises"] = []
+                    repaired = json.dumps(repaired_data)
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    pass
+
+            try:
+                parsed = response_model.model_validate_json(repaired)
+            except ValidationError:
+                logger.warning("claude-cli: JSON validation failed, returning empty fallback")
+                parsed = PromptRepresentation(explicit=[])  # type: ignore[assignment]
+
+            return HonchoLLMCallResponse(
+                content=parsed,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_creation_input_tokens=cache_creation,
+                cache_read_input_tokens=cache_read,
+                finish_reasons=["stop"],
+                tool_calls_made=[],
+            )
+
+        return HonchoLLMCallResponse(
+            content=repaired,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
+            finish_reasons=["stop"],
+            tool_calls_made=[],
+        )
+
+    return HonchoLLMCallResponse(
+        content=result_text,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_input_tokens=cache_creation,
+        cache_read_input_tokens=cache_read,
+        finish_reasons=["stop"],
+        tool_calls_made=[],
+    )
+
 
 
 @overload
@@ -2345,6 +2504,16 @@ async def honcho_llm_call_inner(
                 )
 
 
+        case str():  # claude-cli sentinel
+            return await _call_claude_cli(
+                prompt=params["messages"][-1]["content"] if params.get("messages") else params.get("prompt", ""),
+                model=params.get("model"),
+                max_tokens=params.get("max_tokens", 1024),
+                json_mode=json_mode,
+                response_model=response_model,
+            )
+
+
 async def handle_streaming_response(
     client: AsyncAnthropic | AsyncOpenAI | genai.Client | AsyncGroq,
     params: dict[str, Any],
@@ -2573,3 +2742,8 @@ async def handle_streaming_response(
                         is_done=True,
                         finish_reasons=[chunk.choices[0].finish_reason],
                     )
+
+        case str():  # claude-cli sentinel — streaming not supported
+            raise NotImplementedError(
+                "claude-cli provider does not support streaming responses"
+            )

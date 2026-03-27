@@ -2,6 +2,12 @@
 # https://testdriven.io/blog/docker-best-practices/
 FROM python:3.13-slim-bookworm
 
+# Install Node.js 22 (required for claude-cli provider)
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=ghcr.io/astral-sh/uv:0.9.24 /uv /bin/uv
 
 # Set Working directory
