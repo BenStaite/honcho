@@ -289,21 +289,52 @@ if settings.LLM.GROQ_API_KEY:
 # Register a sentinel string so the startup validation check passes.
 CLIENTS["claude-cli"] = "claude-cli"  # type: ignore[assignment]
 
-def _is_oauth_token(key: str) -> bool:
-    """Return True if key is a Claude OAuth/setup token rather than a regular API key.
+def _read_claude_oauth_token() -> str | None:
+    """Read OAuth access token directly from ~/.claude/.credentials.json.
 
-    Regular API keys start with sk-ant-api. OAuth tokens (from Claude Max
-    subscription via /login) start with sk-ant but are NOT sk-ant-api.
+    Checks multiple candidate paths to handle different HOME environments
+    (e.g. Docker containers where HOME=/app but mount is at /root/.claude).
+    Falls back to LLM_ANTHROPIC_API_KEY env var if set and looks like an OAuth token.
     """
+    import json as _json, os as _os
+    from pathlib import Path
+
+    candidates = [
+        Path("/tmp/claude-credentials.json"),              # Docker bind-mount (neutral path)
+        Path("/root/.claude/.credentials.json"),           # Docker with root HOME
+        Path.home() / ".claude" / ".credentials.json",    # native HOME
+        Path("/home") / _os.environ.get("USER", "ben") / ".claude" / ".credentials.json",
+    ]
+    config_dir = _os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        candidates.insert(0, Path(config_dir) / ".credentials.json")
+
+    for cred_path in candidates:
+        try:
+            if cred_path.exists():
+                data = _json.loads(cred_path.read_text(encoding="utf-8"))
+                token = data.get("claudeAiOauth", {}).get("accessToken", "")
+                if token:
+                    return token
+        except Exception:
+            continue
+    return None
+
+
+def _is_oauth_token(key: str) -> bool:
+    """Return True if key is a Claude OAuth/setup token (not a regular Console API key)."""
     if not key:
         return False
     return not key.startswith("sk-ant-api")
 
 
-# If the configured Anthropic API key is an OAuth token, rebuild the client
-# with Bearer auth and the required Claude Code headers.
-# This allows Honcho to use a Claude Max subscription with no separate API key.
-if settings.LLM.ANTHROPIC_API_KEY and _is_oauth_token(settings.LLM.ANTHROPIC_API_KEY):
+# Try to get an OAuth token — prefer reading directly from credentials file
+# so it stays fresh without requiring .env updates when the token rotates.
+_oauth_token = _read_claude_oauth_token()
+if not _oauth_token and settings.LLM.ANTHROPIC_API_KEY and _is_oauth_token(settings.LLM.ANTHROPIC_API_KEY):
+    _oauth_token = settings.LLM.ANTHROPIC_API_KEY
+
+if _oauth_token:
     import os as _os
     _oauth_betas = [
         "interleaved-thinking-2025-05-14",
@@ -315,7 +346,7 @@ if settings.LLM.ANTHROPIC_API_KEY and _is_oauth_token(settings.LLM.ANTHROPIC_API
     _env_api_key = _os.environ.pop("ANTHROPIC_API_KEY", None)
     try:
         _oauth_anthropic = AsyncAnthropic(
-            auth_token=settings.LLM.ANTHROPIC_API_KEY,
+            auth_token=_oauth_token,
             timeout=600.0,
             default_headers={
                 "anthropic-beta": ",".join(_oauth_betas),
