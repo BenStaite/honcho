@@ -289,6 +289,47 @@ if settings.LLM.GROQ_API_KEY:
 # Register a sentinel string so the startup validation check passes.
 CLIENTS["claude-cli"] = "claude-cli"  # type: ignore[assignment]
 
+def _is_oauth_token(key: str) -> bool:
+    """Return True if key is a Claude OAuth/setup token rather than a regular API key.
+
+    Regular API keys start with sk-ant-api. OAuth tokens (from Claude Max
+    subscription via /login) start with sk-ant but are NOT sk-ant-api.
+    """
+    if not key:
+        return False
+    return not key.startswith("sk-ant-api")
+
+
+# If the configured Anthropic API key is an OAuth token, rebuild the client
+# with Bearer auth and the required Claude Code headers.
+# This allows Honcho to use a Claude Max subscription with no separate API key.
+if settings.LLM.ANTHROPIC_API_KEY and _is_oauth_token(settings.LLM.ANTHROPIC_API_KEY):
+    import os as _os
+    _oauth_betas = [
+        "interleaved-thinking-2025-05-14",
+        "fine-grained-tool-streaming-2025-05-14",
+        "claude-code-20250219",
+        "oauth-2025-04-20",
+    ]
+    # Temporarily unset ANTHROPIC_API_KEY so the SDK uses auth_token (Bearer) not api_key (x-api-key)
+    _env_api_key = _os.environ.pop("ANTHROPIC_API_KEY", None)
+    try:
+        _oauth_anthropic = AsyncAnthropic(
+            auth_token=settings.LLM.ANTHROPIC_API_KEY,
+            timeout=600.0,
+            default_headers={
+                "anthropic-beta": ",".join(_oauth_betas),
+                "user-agent": "claude-cli/2.1.81 (external, cli)",
+                "x-app": "cli",
+            },
+        )
+    finally:
+        if _env_api_key is not None:
+            _os.environ["ANTHROPIC_API_KEY"] = _env_api_key
+    CLIENTS["anthropic"] = _oauth_anthropic
+    logger.warning("Honcho: using Claude OAuth token for Anthropic provider (Bearer auth)")
+
+
 SELECTED_PROVIDERS = [
     ("Summary", settings.SUMMARY.PROVIDER),
     ("Deriver", settings.DERIVER.PROVIDER),
