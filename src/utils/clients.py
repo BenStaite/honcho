@@ -328,6 +328,41 @@ def _is_oauth_token(key: str) -> bool:
     return not key.startswith("sk-ant-api")
 
 
+
+def _get_fresh_oauth_client():
+    """Return a fresh AsyncAnthropic client using the current OAuth token from disk.
+
+    Called at LLM call time (not module load time) so the client always uses
+    the latest token — even if it was refreshed after the process started.
+    Returns None if no OAuth token is available.
+    """
+    import os as _os
+    token = _read_claude_oauth_token()
+    if not token:
+        return None
+    _betas = [
+        "interleaved-thinking-2025-05-14",
+        "fine-grained-tool-streaming-2025-05-14",
+        "claude-code-20250219",
+        "oauth-2025-04-20",
+    ]
+    _env_api_key = _os.environ.pop("ANTHROPIC_API_KEY", None)
+    try:
+        client = AsyncAnthropic(
+            auth_token=token,
+            timeout=600.0,
+            default_headers={
+                "anthropic-beta": ",".join(_betas),
+                "user-agent": "claude-cli/2.1.81 (external, cli)",
+                "x-app": "cli",
+            },
+        )
+    finally:
+        if _env_api_key is not None:
+            _os.environ["ANTHROPIC_API_KEY"] = _env_api_key
+    return client
+
+
 # Try to get an OAuth token — prefer reading directly from credentials file
 # so it stays fresh without requiring .env updates when the token rotates.
 _oauth_token = _read_claude_oauth_token()
@@ -1878,7 +1913,17 @@ async def honcho_llm_call_inner(
     messages: list[dict[str, Any]] | None = None,
 ) -> HonchoLLMCallResponse[Any] | AsyncIterator[HonchoLLMCallStreamChunk]:
     # has already been validated by honcho_llm_call
-    client = CLIENTS[provider]
+    # For the anthropic provider with OAuth, re-read the token from disk on every
+    # call so a refreshed token is picked up without restarting the process.
+    if provider == "anthropic" and CLIENTS.get("anthropic") is not None:
+        from anthropic import AsyncAnthropic as _AA
+        if isinstance(CLIENTS["anthropic"], _AA):
+            fresh = _get_fresh_oauth_client()
+            client = fresh if fresh is not None else CLIENTS[provider]
+        else:
+            client = CLIENTS[provider]
+    else:
+        client = CLIENTS[provider]
 
     # Use messages if provided, otherwise convert prompt to message
     if messages is None:
